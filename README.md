@@ -1,5 +1,7 @@
 # Qiansai25_MainCode
-An integrated intelligent pharmacy warehouse that integrates medication management.集用药管理平台的一体化药仓![QQ截图20250622031556](https://github.com/user-attachments/assets/26797abc-387c-4e21-9396-c810db961317)
+An integrated intelligent pharmacy warehouse that integrates medication management.集用药管理平台的一体化药仓
+
+![QQ截图20250622031556](https://github.com/user-attachments/assets/26797abc-387c-4e21-9396-c810db961317)
 
 主控采用STM32F407vgt6，
 
