@@ -2,7 +2,7 @@
  * @Author: 星必尘Sguan
  * @Date: 2025-06-28 21:15:48
  * @LastEditors: 星必尘Sguan|3464647102@qq.com
- * @LastEditTime: 2025-06-30 18:18:06
+ * @LastEditTime: 2025-07-05 00:27:57
  * @FilePath: \demo_STM32G431code\Software\Robotic_Arm.c
  * @Description: 调用PCA9685控制机械臂上的5个舵机（应用层实现）
  * 
@@ -11,6 +11,8 @@
 #include "Robotic_Arm.h"
 
 extern I2C_HandleTypeDef hi2c1;
+extern DMA_HandleTypeDef hdma_usart2_rx;
+extern UART_HandleTypeDef huart2;
 PCA9685_HandleTypeDef hpca;
 
 
@@ -21,6 +23,29 @@ static const uint8_t Single_Step = 200;
 // 舵机角度计数器
 static int8_t Angle_Count[5] = {0}; // B, L, U, R, X方向
 static uint8_t Motor_Control_Count = 0;
+//舵机测试局参
+// static uint8_t DataOk[] = "Set Motor Yeah!";    // 语义上可能char更合适
+uint8_t Robotic_Readbuffer[256];
+//步进电机绝对坐标（原点）
+int16_t CoordinateX,CoordinateY;
+
+
+/**
+ * @description: 舵机and步进电机的绝对运动点位(宏定义)
+ * @return {*}
+ */
+#define Central_Axis_BX -250     //0号位中轴线-距离原点(步进电机)
+#define Take_Point_BY -200      //0号位Y轴坐标-距离原点(步进电机)
+#define Locus_Point1_L 210.0f   //1号高度位置（L轴舵机）
+#define Locus_Point1_U 110.0f   //1号高度位置（U轴舵机）
+#define Locus_Point2_L 195.0f   //2号高度位置（L轴舵机）
+#define Locus_Point2_U 180.0f   //2号高度位置（U轴舵机）
+#define Locus_WaitTake_U 160.0f //0号位等待抓取（U轴舵机）
+#define InputX_B 45.0f          //B轴朝向左方
+#define OutputX_B 225.0f        //B轴朝向右方
+#define OpenClaws_X 195.0f      //完全开合机械爪（X轴）
+#define CloseClaws_Y 250.0f     //关闭机械夹爪（X轴）
+//步进电机的活动范围是X(200,-1500),Y轴范围为(0,-200);
 
 
 /**
@@ -35,11 +60,65 @@ void Robotic_Init(void) {
     PCA9685_SetServoAngle(&hpca, U_AXIS, SERVO_270_DEGREE, U_INIT_ANGLE);
     PCA9685_SetServoAngle(&hpca, R_AXIS, SERVO_270_DEGREE, L_INIT_ANGLE+U_INIT_ANGLE-LU_R_Angle);
     PCA9685_SetServoAngle(&hpca, X_CLAWS, SERVO_270_DEGREE, X_INIT_ANGLE);
+    HAL_UARTEx_ReceiveToIdle_DMA(&huart2,Robotic_Readbuffer,sizeof(Robotic_Readbuffer));
+    __HAL_DMA_DISABLE_IT(&hdma_usart2_rx,DMA_IT_HT);
 }
 
 
 /**
- * @description: 控制舵机或步进电机
+ * @description: (私域)步进电机实际坐标到达函数
+ * @param {int16_t} X   输入绝对X轴坐标
+ * @param {int16_t} Y   输入绝对Y轴坐标
+ * @return {*}
+ */
+static void Locus_StepperToXY(int16_t X,int16_t Y) {
+    //与原来绝对坐标做差
+    int16_t input_X = X - CoordinateX;
+    int16_t input_Y = Y - CoordinateY;
+    //更新XY轴目前的坐标
+    CoordinateX = X;
+    CoordinateY = Y;
+    //XY轴方向判断
+    int8_t DirX = (input_X >= 0) ? 1 : -1;
+    int8_t DirY = (input_Y >= 0) ? 1 : -1;
+    //设置电机转到对应位置
+    StepperMotor_Control(0,DirX*Motor_Velocity,(uint16_t)abs(input_X));
+    StepperMotor_Control(1,DirY*Motor_Velocity,(uint16_t)abs(input_Y));
+}
+
+
+/**
+ * @description: (私域)舵机机械臂控制函数
+ * @param {float} B_axis    B轴角度信息
+ * @param {float} L_axis    L轴角度信息
+ * @param {float} U_axis    U轴角度信息
+ * @return {*}
+ */
+static void Locus_ServoToAngle(float BF_axis,float LF_axis,float UF_axis,float XF_claws)
+{
+    PCA9685_SetServoAngle(&hpca, B_AXIS, SERVO_270_DEGREE, BF_axis);
+    PCA9685_SetServoAngle(&hpca, L_AXIS, SERVO_270_DEGREE, LF_axis);
+    PCA9685_SetServoAngle(&hpca, U_AXIS, SERVO_270_DEGREE, UF_axis);
+    // R轴角度需要特殊处理，保持与L轴和U轴的联动关系
+    PCA9685_SetServoAngle(&hpca, R_AXIS, SERVO_270_DEGREE, LF_axis + UF_axis - LU_R_Angle);
+    PCA9685_SetServoAngle(&hpca, X_CLAWS, SERVO_270_DEGREE, XF_claws);
+}
+
+
+// static void Locus_XclaawsTake(void)
+// {
+//     uint8_t count;
+//     if (condition)
+//     {
+//         /* code */
+//     }
+    
+//     PCA9685_SetServoAngle(&hpca, X_CLAWS, SERVO_270_DEGREE, OpenClaws_X + Single_Angle*count);
+// }
+
+
+/**
+ * @description: (私域)控制舵机或步进电机
  * @param {uint8_t} count
  * @param {int8_t} direction
  * @return {*}
@@ -91,7 +170,7 @@ static void ControlDevice(uint8_t count, int8_t direction) {
  * @function: 按下按键1，切换控制的电机|按键2，电机正向旋转一定距离|按键3，电机反向旋转
  * @return {*}
  */
-void Robotic_Test(void) {
+void Robotic_KeyTest(void) {
     uint8_t Key_count = Key_GetNum();
     switch (Key_count) {
         case 1:
@@ -111,58 +190,335 @@ void Robotic_Test(void) {
 
 
 /**
- * @description: 运行路线1的前半阶段
+ * @description: 处理串口接收到的数据并控制机械臂
  * @return {*}
  */
-static void ControlTransport_Way1(void)
-{
-    if (count == 1)
-    {
-        
+void Robotic_UartTest(void) {
+    // 检查是否有完整的数据接收（7个数字，每个数字用空格分隔）
+    uint8_t spaceCount = 0;
+    for (uint8_t i = 0; i < sizeof(Robotic_Readbuffer); i++) {
+        if (Robotic_Readbuffer[i] == ' ') {
+            spaceCount++;
+        }
+        if (Robotic_Readbuffer[i] == '\0' || Robotic_Readbuffer[i] == '\r' || Robotic_Readbuffer[i] == '\n') {
+            break;
+        }
     }
     
+    // 如果有6个空格，说明有7个数字
+    if (spaceCount == 6) {
+        float servoAngles[5];
+        int16_t stepperSteps[2];
+        char *token = (char *)strtok((char *)Robotic_Readbuffer, " ");
+        uint8_t index = 0;
+        
+        // 解析接收到的数据
+        while (token != NULL && index < 7) {
+            if (index < 5) {
+                servoAngles[index] = (float)atof(token);
+            } else {
+                stepperSteps[index - 5] = (int16_t)atoi(token);
+            }
+            token = (char *)strtok(NULL, " ");
+            index++;
+        }
+        //设置舵机角度
+        Locus_ServoToAngle(servoAngles[0],servoAngles[1],servoAngles[2],servoAngles[4]);
+        // 控制步进电机
+        int8_t direction0 = (stepperSteps[0] >= 0) ? 1 : -1;
+        int8_t direction1 = (stepperSteps[1] >= 0) ? 1 : -1;
+        StepperMotor_Control(0, direction0 * Motor_Velocity, (uint16_t)abs(stepperSteps[0]));
+        StepperMotor_Control(1, direction1 * Motor_Velocity, (uint16_t)abs(stepperSteps[1]));
+        // 更新角度计数器（如果需要）
+        Angle_Count[0] = (int8_t)((servoAngles[0] - B_INIT_ANGLE) / Single_Angle);
+        Angle_Count[1] = (int8_t)((servoAngles[1] - L_INIT_ANGLE) / Single_Angle);
+        Angle_Count[2] = (int8_t)((servoAngles[2] - U_INIT_ANGLE) / Single_Angle);
+        Angle_Count[4] = (int8_t)((servoAngles[4] - X_INIT_ANGLE) / Single_Angle);
+    }
+}
+
+
+/**
+ * @description: 运行轨迹其一（0号位到2号厂库）
+ * Locus_StepperToXY函数和Locus_ServoToAngle函数
+ * @return {*}
+ */
+static void Locus_RunWay1(void)
+{
+    Locus_StepperToXY(-250,-130);
+    Locus_ServoToAngle(135.0f,210.0f,170.0f,195.0f);
+    HAL_Delay(1000);
+    Locus_ServoToAngle(135.0f,210.0f,120.0f,195.0f);
+    HAL_Delay(1000);
+    PCA9685_SetServoAngle(&hpca, X_CLAWS, SERVO_270_DEGREE, 220.0f);
+    HAL_Delay(800);
+    Locus_ServoToAngle(135.0f,210.0f,150.0f,220.0f);
+    HAL_Delay(800);
+    Locus_ServoToAngle(135.0f,210.0f,190.0f,220.0f);
+    HAL_Delay(600);
+    Locus_ServoToAngle(135.0f,205.0f,190.0f,220.0f);
+    HAL_Delay(400);
+    Locus_ServoToAngle(135.0f,195.0f,190.0f,220.0f);
+    Locus_StepperToXY(-1500,0);
+    HAL_Delay(2500);
+    Locus_ServoToAngle(35.0f,195.0f,190.0f,220.0f);
+    HAL_Delay(300);
+    Locus_StepperToXY(-500,0);
+    HAL_Delay(2000);
+    Locus_ServoToAngle(35.0f,195.0f,190.0f,195.0f);
+    HAL_Delay(600);
+    Locus_StepperToXY(-1500,0);
+    HAL_Delay(2000);
+    Locus_ServoToAngle(135.0f,210.0f,170.0f,220.0f);
+    Locus_StepperToXY(0,0);
+}
+
+
+static void Locus_RunWay2(void)
+{
+    Locus_StepperToXY(-250,-130);
+    Locus_ServoToAngle(135.0f,210.0f,170.0f,195.0f);
+    HAL_Delay(1000);
+    Locus_ServoToAngle(135.0f,210.0f,120.0f,195.0f);
+    HAL_Delay(1000);
+    PCA9685_SetServoAngle(&hpca, X_CLAWS, SERVO_270_DEGREE, 220.0f);
+    HAL_Delay(800);
+    Locus_ServoToAngle(135.0f,210.0f,150.0f,220.0f);
+    HAL_Delay(800);
+    Locus_ServoToAngle(135.0f,210.0f,190.0f,220.0f);
+    HAL_Delay(600);
+    Locus_ServoToAngle(135.0f,205.0f,190.0f,220.0f);
+    HAL_Delay(400);
+    Locus_ServoToAngle(135.0f,195.0f,190.0f,220.0f);
+    Locus_StepperToXY(300,0);
+    HAL_Delay(1100);
+    Locus_ServoToAngle(235.0f,195.0f,190.0f,220.0f);
+    HAL_Delay(300);
+    Locus_StepperToXY(-700,0);
+    HAL_Delay(1900);
+    Locus_ServoToAngle(235.0f,195.0f,190.0f,195.0f);
+    HAL_Delay(600);
+    Locus_StepperToXY(300,0);
+    HAL_Delay(2000);
+    Locus_ServoToAngle(135.0f,210.0f,170.0f,220.0f);
+    Locus_StepperToXY(0,0);
+}
+
+
+static void Locus_RunWay3(void)
+{
+    Locus_StepperToXY(-250,-130);
+    Locus_ServoToAngle(135.0f,210.0f,170.0f,195.0f);
+    HAL_Delay(1000);
+    Locus_ServoToAngle(135.0f,210.0f,120.0f,195.0f);
+    HAL_Delay(1000);
+    PCA9685_SetServoAngle(&hpca, X_CLAWS, SERVO_270_DEGREE, 220.0f);
+    HAL_Delay(800);
+    Locus_ServoToAngle(135.0f,210.0f,135.0f,220.0f);
+    HAL_Delay(600);
+    Locus_StepperToXY(-1500,0);
+    HAL_Delay(2500);
+    Locus_ServoToAngle(35.0f,210.0f,135.0f,220.0f);
+    HAL_Delay(800);
+    Locus_ServoToAngle(35.0f,210.0f,120.0f,220.0f);
+    HAL_Delay(800);
+    Locus_StepperToXY(-720,0);
+    HAL_Delay(2000);
+    Locus_ServoToAngle(35.0f,210.0f,120.0f,195.0f);
+    HAL_Delay(600);
+    Locus_StepperToXY(-1500,0);
+    HAL_Delay(2000);
+    Locus_ServoToAngle(35.0f,210.0f,135.0f,195.0f);
+    HAL_Delay(400);
+    Locus_ServoToAngle(135.0f,210.0f,170.0f,220.0f);
+    Locus_StepperToXY(0,0);
+}
+
+
+
+static void Locus_RunWay4(void)
+{
+    Locus_StepperToXY(-250,-130);
+    Locus_ServoToAngle(135.0f,210.0f,170.0f,195.0f);
+    HAL_Delay(1000);
+    Locus_ServoToAngle(135.0f,210.0f,120.0f,195.0f);
+    HAL_Delay(1000);
+    PCA9685_SetServoAngle(&hpca, X_CLAWS, SERVO_270_DEGREE, 220.0f);
+    HAL_Delay(800);
+    Locus_ServoToAngle(135.0f,210.0f,135.0f,220.0f);
+    HAL_Delay(600);
+    Locus_StepperToXY(300,0);
+    HAL_Delay(1100);
+    Locus_ServoToAngle(235.0f,210.0f,135.0f,220.0f);
+    HAL_Delay(800);
+    Locus_ServoToAngle(235.0f,210.0f,120.0f,220.0f);
+    HAL_Delay(800);
+    Locus_StepperToXY(-480,0);
+    HAL_Delay(1900);
+    Locus_ServoToAngle(235.0f,210.0f,120.0f,195.0f);
+    HAL_Delay(600);
+    Locus_StepperToXY(300,0);
+    HAL_Delay(2000);
+    Locus_ServoToAngle(235.0f,210.0f,135.0f,195.0f);
+    HAL_Delay(800);
+    Locus_ServoToAngle(135.0f,210.0f,170.0f,220.0f);
+    Locus_StepperToXY(0,0);
+}
+
+
+/**
+ * @description: 运行轨迹其五（2号厂库到0号位）
+ * @return {*}
+ */
+static void Locus_RunWay5(void)
+{
+    Locus_StepperToXY(-1500,0);
+    Locus_ServoToAngle(135.0f,195.0f,190.0f,195.0f);
+    HAL_Delay(3000);
+    Locus_ServoToAngle(35.0f,195.0f,190.0f,195.0f);
+    HAL_Delay(600);
+    Locus_StepperToXY(-500,0);
+    HAL_Delay(2000);
+    Locus_ServoToAngle(35.0f,195.0f,190.0f,220.0f); // 抓取
+    HAL_Delay(600);
+    Locus_StepperToXY(-1500,0);
+    HAL_Delay(2000);
+    Locus_ServoToAngle(135.0f,210.0f,170.0f,220.0f);
+    HAL_Delay(800);
+    Locus_StepperToXY(-250,-130);
+    HAL_Delay(3500);
+    Locus_ServoToAngle(135.0f,210.0f,120.0f,220.0f);
+    HAL_Delay(600);
+    Locus_ServoToAngle(135.0f,210.0f,120.0f,195.0f);
+    HAL_Delay(800);
+    Locus_ServoToAngle(135.0f,210.0f,150.0f,195.0f);
+    HAL_Delay(800);
+    Locus_StepperToXY(0,0);
+    Locus_ServoToAngle(135.0f,210.0f,170.0f,195.0f);
+}
+
+
+static void Locus_RunWay6(void)
+{
+    Locus_StepperToXY(300,0);
+    Locus_ServoToAngle(135.0f,195.0f,190.0f,195.0f);
+    HAL_Delay(3000);
+    Locus_ServoToAngle(235.0f,195.0f,190.0f,195.0f);
+    HAL_Delay(600);
+    Locus_StepperToXY(-700,0);
+    HAL_Delay(2000);
+    Locus_ServoToAngle(235.0f,195.0f,190.0f,220.0f); // 抓取
+    HAL_Delay(600);
+    Locus_StepperToXY(300,0);
+    HAL_Delay(2000);
+    Locus_ServoToAngle(135.0f,210.0f,170.0f,220.0f);
+    HAL_Delay(800);
+    Locus_StepperToXY(-250,-130);
+    HAL_Delay(1500);
+    Locus_ServoToAngle(135.0f,210.0f,120.0f,220.0f);
+    HAL_Delay(600);
+    Locus_ServoToAngle(135.0f,210.0f,120.0f,195.0f);
+    HAL_Delay(800);
+    Locus_ServoToAngle(135.0f,210.0f,150.0f,195.0f);
+    HAL_Delay(800);
+    Locus_StepperToXY(0,0);
+    Locus_ServoToAngle(135.0f,210.0f,170.0f,195.0f);
+}
+
+
+static void Locus_RunWay7(void)
+{
+    Locus_StepperToXY(-250,-130);
+    Locus_ServoToAngle(135.0f,210.0f,170.0f,195.0f);
+    HAL_Delay(1000);
+    Locus_ServoToAngle(135.0f,210.0f,120.0f,195.0f);
+    HAL_Delay(1000);
+    PCA9685_SetServoAngle(&hpca, X_CLAWS, SERVO_270_DEGREE, 220.0f);
+    HAL_Delay(800);
+    Locus_ServoToAngle(135.0f,210.0f,135.0f,220.0f);
+    HAL_Delay(600);
+    Locus_StepperToXY(-1500,0);
+    HAL_Delay(2500);
+    Locus_ServoToAngle(35.0f,210.0f,135.0f,220.0f);
+    HAL_Delay(800);
+    Locus_ServoToAngle(35.0f,210.0f,120.0f,220.0f);
+    HAL_Delay(800);
+    Locus_StepperToXY(-720,0);
+    HAL_Delay(2000);
+    Locus_ServoToAngle(35.0f,210.0f,120.0f,195.0f);
+    HAL_Delay(600);
+    Locus_StepperToXY(-1500,0);
+    HAL_Delay(2000);
+    Locus_ServoToAngle(35.0f,210.0f,135.0f,195.0f);
+    HAL_Delay(400);
+    Locus_ServoToAngle(135.0f,210.0f,170.0f,220.0f);
+    Locus_StepperToXY(0,0);
+}
+
+
+
+static void Locus_RunWay8(void)
+{
+    Locus_StepperToXY(-250,-130);
+    Locus_ServoToAngle(135.0f,210.0f,170.0f,195.0f);
+    HAL_Delay(1000);
+    Locus_ServoToAngle(135.0f,210.0f,120.0f,195.0f);
+    HAL_Delay(1000);
+    PCA9685_SetServoAngle(&hpca, X_CLAWS, SERVO_270_DEGREE, 220.0f);
+    HAL_Delay(800);
+    Locus_ServoToAngle(135.0f,210.0f,135.0f,220.0f);
+    HAL_Delay(600);
+    Locus_StepperToXY(300,0);
+    HAL_Delay(1100);
+    Locus_ServoToAngle(235.0f,210.0f,135.0f,220.0f);
+    HAL_Delay(800);
+    Locus_ServoToAngle(235.0f,210.0f,120.0f,220.0f);
+    HAL_Delay(800);
+    Locus_StepperToXY(-480,0);
+    HAL_Delay(1900);
+    Locus_ServoToAngle(235.0f,210.0f,120.0f,195.0f);
+    HAL_Delay(600);
+    Locus_StepperToXY(300,0);
+    HAL_Delay(2000);
+    Locus_ServoToAngle(235.0f,210.0f,135.0f,195.0f);
+    HAL_Delay(800);
+    Locus_ServoToAngle(135.0f,210.0f,170.0f,220.0f);
+    Locus_StepperToXY(0,0);
+}
+
+
+
+void Robotic_KeyControl(void) {
+    uint8_t temp = Key_GetNum();
+    if (temp == 1) {
+        Locus_RunWay1();
+    }
+    if (temp == 2) {
+        Locus_RunWay5();
+    }
+    if (temp == 3) {
+        Locus_RunWay6();
+    } 
 }
 
 
 
 
+
 /**
- * @description: 根据命令，执行机械臂运输的函数实现
- * @param {uint8_t} *command
+ * @description: 串口回调函数（用于发送命令）
+ * @param {UART_HandleTypeDef} *huart
+ * @param {uint16_t} Size
  * @return {*}
  */
-void Robotic_Transport(uint8_t *command)
-{
-    switch (command)
-    {
-    case 0x02:
-        /* code */
-        break;
-    case 0x04:
-        /* code */
-        break;
-    case 0x07:
-        /* code */
-        break;
-    case 0x09:
-        /* code */
-        break;
-
-    case 0x12:
-        /* code */
-        break;
-    case 0x14:
-        /* code */
-        break;
-    case 0x17:
-        /* code */
-        break;
-    case 0x19:
-        /* code */
-        break;
-
-    default:
-        break;
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {
+    if (huart == &huart2) {
+        // 处理接收到的数据
+        // Robotic_UartTest();
+        HAL_GPIO_TogglePin(GPIOC,GPIO_PIN_13);
+        //重新开启DMA串口中断
+        HAL_UARTEx_ReceiveToIdle_DMA(&huart2,Robotic_Readbuffer,sizeof(Robotic_Readbuffer));
+        __HAL_DMA_DISABLE_IT(&hdma_usart2_rx,DMA_IT_HT);
     }
 }
 
