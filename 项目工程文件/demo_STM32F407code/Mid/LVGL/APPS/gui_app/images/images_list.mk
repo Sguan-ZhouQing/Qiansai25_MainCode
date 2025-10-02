@@ -1,0 +1,1 @@
+GEN_CSRCS += _63_alpha_50x50.c _65_alpha_50x50.c _33_alpha_50x50.c _37_alpha_50x50.c _31_alpha_50x50.c _72_alpha_50x50.c _38_alpha_70x70.c _39_alpha_70x70.c _41_alpha_70x70.c _40_alpha_70x70.c _36_alpha_70x70.c _34_alpha_70x70.c _32_alpha_70x70.c _99_alpha_70x60.c _56_alpha_100x100.c _53_alpha_100x100.c _55_alpha_100x100.c _57_alpha_100x100.c _2_alpha_100x100.c _1_alpha_100x100.c
